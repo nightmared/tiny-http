@@ -94,21 +94,23 @@ let _ = request.respond(response);
 #![forbid(unsafe_code)]
 
 use std::error::Error;
+use std::future::Future;
 use std::io::Error as IoError;
 use std::io::Result as IoResult;
-use std::net;
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::{self, Shutdown};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::mpsc;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use log::{debug, error};
 
+use async_net::{AsyncToSocketAddrs, TcpListener, TcpStream};
+use futures_lite::future::block_on;
+
 use client::ClientConnection;
-use util::MessagesQueue;
+//use util::MessagesQueue;
+use util::MultiPoller;
 
 pub use common::{HTTPVersion, Header, HeaderField, Method, StatusCode};
 pub use request::{ReadWrite, Request};
@@ -126,6 +128,9 @@ mod util;
 ///  part of all the client's connections. Requests that have already been returned by
 ///  the `recv()` function will not close and the responses will be transferred to the client.
 pub struct Server {
+    // the executor on which the taks will run
+    //executor: Arc<Executor<'static>>,
+
     // should be false as long as the server exists
     // when set to true, all the subtasks will close within a few hundreds ms
     close: Arc<AtomicBool>,
@@ -136,6 +141,7 @@ pub struct Server {
     // result of TcpListener::local_addr()
     listening_addr: net::SocketAddr,
 
+    // counter of the number of open connections
     num_connections: Arc<AtomicUsize>,
 }
 
@@ -156,12 +162,6 @@ impl From<Request> for Message {
     }
 }
 
-// this trait is to make sure that Server implements Share and Send
-#[doc(hidden)]
-trait MustBeShareDummy: Sync + Send {}
-#[doc(hidden)]
-impl MustBeShareDummy for Server {}
-
 pub struct IncomingRequests<'a> {
     server: &'a Server,
 }
@@ -170,7 +170,7 @@ pub struct IncomingRequests<'a> {
 #[derive(Debug, Clone)]
 pub struct ServerConfig<A>
 where
-    A: ToSocketAddrs,
+    A: AsyncToSocketAddrs,
 {
     /// The addresses to listen to.
     pub addr: A,
@@ -188,12 +188,17 @@ pub struct SslConfig {
     pub private_key: Vec<u8>,
 }
 
+#[cfg(feature = "ssl")]
+type SslContext = openssl::ssl::SslContext;
+#[cfg(not(feature = "ssl"))]
+type SslContext = ();
+
 impl Server {
     /// Shortcut for a simple server on a specific address.
     #[inline]
-    pub fn http<A>(addr: A) -> Result<Server, Box<dyn Error + Send + Sync + 'static>>
+    pub fn http<A>(addr: A) -> Result<Arc<Server>, Box<dyn Error + Sync + 'static>>
     where
-        A: ToSocketAddrs,
+        A: AsyncToSocketAddrs,
     {
         Server::new(ServerConfig { addr, ssl: None })
     }
@@ -201,12 +206,9 @@ impl Server {
     /// Shortcut for an HTTPS server on a specific address.
     #[cfg(feature = "ssl")]
     #[inline]
-    pub fn https<A>(
-        addr: A,
-        config: SslConfig,
-    ) -> Result<Server, Box<Error + Send + Sync + 'static>>
+    pub fn https<A>(addr: A, config: SslConfig) -> Result<Arc<Server>, Box<dyn Error + 'static>>
     where
-        A: ToSocketAddrs,
+        A: AsyncToSocketAddrs,
     {
         Server::new(ServerConfig {
             addr,
@@ -214,27 +216,98 @@ impl Server {
         })
     }
 
+    async fn run_client(self: Arc<Self>, client: ClientConnection) -> IoResult<()> {
+        println!("polled2");
+        // Synchronization is needed for HTTPS requests to avoid a deadlock
+        if client.secure() {
+            let (sender, receiver) = async_channel::unbounded();
+            while let Some(rq) = client.next().await {
+                self.messages
+                    .push(rq.with_notify_sender(sender.clone()).into());
+                receiver.recv().unwrap();
+            }
+        } else {
+            while let Some(rq) = client.next().await {
+                self.messages.push(rq.into());
+            }
+        }
+        self.num_connections.fetch_sub(1, Relaxed);
+        Ok(())
+    }
+
+    async fn runner_task(
+        self: Arc<Self>,
+        selector: Arc<MultiPoller<dyn Future<Output = IoResult<()>>>>,
+        server: TcpListener,
+        ssl: Option<SslContext>,
+    ) -> IoResult<()> {
+        debug!("Running accept thread");
+        println!("polled1");
+        while !self.close.load(Relaxed) {
+            let new_client = match server.accept().await {
+                Ok((sock, _)) => {
+                    self.num_connections.fetch_add(1, Relaxed);
+                    use util::RefinedTcpStream;
+                    let (read_closable, write_closable) = match ssl {
+                        None => RefinedTcpStream::new(sock),
+                        #[cfg(feature = "ssl")]
+                        Some(ref ssl) => {
+                            let ssl = openssl::ssl::Ssl::new(ssl).expect("Couldn't create ssl");
+                            // trying to apply SSL over the connection
+                            // if an error occurs, we just close the socket and resume listening
+                            let sock = match ssl.accept(sock) {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+
+                            RefinedTcpStream::new(sock)
+                        }
+                        #[cfg(not(feature = "ssl"))]
+                        Some(_) => unreachable!(),
+                    };
+
+                    Ok(ClientConnection::new(write_closable, read_closable))
+                }
+                Err(e) => Err(e),
+            };
+
+            match new_client {
+                Ok(client) => {
+                    let messages = self.messages.clone();
+                    let num_connections_clone = self.num_connections.clone();
+                    selector.add(Box::pin(self.clone().run_client(client)));
+                }
+                Err(e) => {
+                    self.num_connections.fetch_sub(1, Relaxed);
+                    error!("Error accepting new client: {}", e);
+                    self.messages.push(e.into());
+                    break;
+                }
+            }
+        }
+        debug!("Terminating accept thread");
+        Ok(())
+    }
+
     /// Builds a new server that listens on the specified address.
-    pub fn new<A>(config: ServerConfig<A>) -> Result<Server, Box<dyn Error + Send + Sync + 'static>>
+    pub async fn new_async<A>(
+        config: ServerConfig<A>,
+    ) -> Result<Arc<Server>, Box<dyn Error + 'static>>
     where
-        A: ToSocketAddrs,
+        A: AsyncToSocketAddrs,
     {
         // building the "close" variable
         let close_trigger = Arc::new(AtomicBool::new(false));
 
         // building the TcpListener
         let (server, local_addr) = {
-            let listener = net::TcpListener::bind(config.addr)?;
+            let listener = TcpListener::bind(config.addr).await?;
             let local_addr = listener.local_addr()?;
             debug!("Server listening on {}", local_addr);
             (listener, local_addr)
         };
 
         // building the SSL capabilities
-        #[cfg(feature = "ssl")]
-        type SslContext = openssl::ssl::SslContext;
-        #[cfg(not(feature = "ssl"))]
-        type SslContext = ();
 
         #[cfg(feature = "ssl")]
         let ssl: Option<SslContext> = config.ssl.map(|mut config| {
@@ -279,84 +352,38 @@ impl Server {
         let messages = MessagesQueue::with_capacity(8);
 
         let num_connections = Arc::new(AtomicUsize::new(0));
-        let num_connections_clone = num_connections.clone();
 
-        let inside_close_trigger = close_trigger.clone();
-        let inside_messages = messages.clone();
-        thread::spawn(move || {
-            // a tasks pool is used to dispatch the connections into threads
-            let tasks_pool = util::TaskPool::new();
-
-            debug!("Running accept thread");
-            while !inside_close_trigger.load(Relaxed) {
-                let new_client = match server.accept() {
-                    Ok((sock, _)) => {
-                        num_connections_clone.fetch_add(1, Relaxed);
-                        use util::RefinedTcpStream;
-                        let (read_closable, write_closable) = match ssl {
-                            None => RefinedTcpStream::new(sock),
-                            #[cfg(feature = "ssl")]
-                            Some(ref ssl) => {
-                                let ssl = openssl::ssl::Ssl::new(ssl).expect("Couldn't create ssl");
-                                // trying to apply SSL over the connection
-                                // if an error occurs, we just close the socket and resume listening
-                                let sock = match ssl.accept(sock) {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
-                                };
-
-                                RefinedTcpStream::new(sock)
-                            }
-                            #[cfg(not(feature = "ssl"))]
-                            Some(_) => unreachable!(),
-                        };
-
-                        Ok(ClientConnection::new(write_closable, read_closable))
-                    }
-                    Err(e) => Err(e),
-                };
-
-                match new_client {
-                    Ok(client) => {
-                        let messages = inside_messages.clone();
-                        let mut client = Some(client);
-                        let num_connections_clone = num_connections_clone.clone();
-                        tasks_pool.spawn(Box::new(move || {
-                            if let Some(client) = client.take() {
-                                // Synchronization is needed for HTTPS requests to avoid a deadlock
-                                if client.secure() {
-                                    let (sender, receiver) = mpsc::channel();
-                                    for rq in client {
-                                        messages.push(rq.with_notify_sender(sender.clone()).into());
-                                        receiver.recv().unwrap();
-                                    }
-                                } else {
-                                    for rq in client {
-                                        messages.push(rq.into());
-                                    }
-                                }
-                                num_connections_clone.fetch_sub(1, Relaxed);
-                            }
-                        }));
-                    }
-
-                    Err(e) => {
-                        num_connections_clone.fetch_sub(1, Relaxed);
-                        error!("Error accepting new client: {}", e);
-                        inside_messages.push(e.into());
-                        break;
-                    }
-                }
-            }
-            debug!("Terminating accept thread");
-        });
-
-        Ok(Server {
+        let res = Arc::new(Server {
+            //executor,
             messages,
             close: close_trigger,
             listening_addr: local_addr,
             num_connections,
-        })
+        });
+
+        let res_clone = res.clone();
+        thread::spawn(move || {
+            let selector = Arc::new(MultiPoller::new());
+
+            selector.add(Box::pin(res_clone.runner_task(
+                selector.clone(),
+                server,
+                ssl,
+            )));
+
+            let selector_fut = selector.get_future();
+            block_on(selector_fut)
+        });
+
+        Ok(res)
+    }
+
+    /// Builds a new server that listens on the specified address.
+    pub fn new<A>(config: ServerConfig<A>) -> Result<Arc<Server>, Box<dyn Error + Sync + 'static>>
+    where
+        A: AsyncToSocketAddrs,
+    {
+        block_on(Self::new_async(config))
     }
 
     /// Returns an iterator for all the incoming requests.

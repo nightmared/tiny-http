@@ -5,11 +5,15 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-use std::sync::mpsc::Sender;
+use async_channel::Sender;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use crate::util::{self, EqualReader};
 use crate::{HTTPVersion, Header, Method, Response, StatusCode};
 use chunked_transfer::Decoder;
+
+use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Represents an HTTP request made by a client.
 ///
@@ -45,10 +49,10 @@ use chunked_transfer::Decoder;
 /// error" response will automatically be sent during the stack unwinding.
 pub struct Request {
     // where to read the body from
-    data_reader: Option<Box<dyn Read + Send + 'static>>,
+    data_reader: Option<Box<dyn AsyncRead + 'static>>,
 
     // if this writer is empty, then the request has been answered
-    response_writer: Option<Box<dyn Write + Send + 'static>>,
+    response_writer: Option<Box<dyn AsyncWrite + 'static>>,
 
     remote_addr: SocketAddr,
 
@@ -77,22 +81,38 @@ struct NotifyOnDrop<R> {
     inner: R,
 }
 
-impl<R: Read> Read for NotifyOnDrop<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
+impl<R: AsyncRead> AsyncRead for NotifyOnDrop<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.inner).poll_read(cx, buf)
     }
 }
-impl<R: Write> Write for NotifyOnDrop<R> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
+
+impl<R: AsyncWrite> AsyncWrite for NotifyOnDrop<R> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.inner.poll_write(cx, buf)
     }
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.poll_close(cx)
     }
 }
+
 impl<R> Drop for NotifyOnDrop<R> {
     fn drop(&mut self) {
-        self.sender.send(()).unwrap();
+        // TODO: do not block on sending, but there is no async destructors yet in Rust ?
+        futures_lite::future::block_on(self.sender.send(())).unwrap();
     }
 }
 
@@ -131,8 +151,8 @@ pub fn new_request<R, W>(
     writer: W,
 ) -> Result<Request, RequestCreationError>
 where
-    R: Read + Send + 'static,
-    W: Write + Send + 'static,
+    R: AsyncRead + 'static,
+    W: AsyncWrite + 'static,
 {
     // finding the transfer-encoding header
     let transfer_encoding = headers
@@ -181,10 +201,10 @@ where
     // content-length headers
     let reader = if connection_upgrade {
         // if we have a `Connection: upgrade`, always keeping the whole reader
-        Box::new(source_data) as Box<dyn Read + Send + 'static>
+        Box::new(source_data) as Box<dyn Read + 'static>
     } else if let Some(content_length) = content_length {
         if content_length == 0 {
-            Box::new(io::empty()) as Box<dyn Read + Send + 'static>
+            Box::new(io::empty()) as Box<dyn Read + 'static>
         } else if content_length <= 1024 && !expects_continue {
             // if the content-length is small enough, we just read everything into a buffer
 
@@ -204,25 +224,25 @@ where
                 offset += read;
             }
 
-            Box::new(Cursor::new(buffer)) as Box<dyn Read + Send + 'static>
+            Box::new(Cursor::new(buffer)) as Box<dyn Read + 'static>
         } else {
             let (data_reader, _) = EqualReader::new(source_data, content_length); // TODO:
-            Box::new(data_reader) as Box<dyn Read + Send + 'static>
+            Box::new(data_reader) as Box<dyn Read + 'static>
         }
     } else if transfer_encoding.is_some() {
         // if a transfer-encoding was specified, then "chunked" is ALWAYS applied
         // over the message (RFC2616 #3.6)
-        Box::new(Decoder::new(source_data)) as Box<dyn Read + Send + 'static>
+        Box::new(Decoder::new(source_data)) as Box<dyn Read + 'static>
     } else {
         // if we have neither a Content-Length nor a Transfer-Encoding,
         // assuming that we have no data
         // TODO: could also be multipart/byteranges
-        Box::new(io::empty()) as Box<dyn Read + Send + 'static>
+        Box::new(io::empty()) as Box<dyn Read + 'static>
     };
 
     Ok(Request {
         data_reader: Some(reader),
-        response_writer: Some(Box::new(writer) as Box<dyn Write + Send + 'static>),
+        response_writer: Some(Box::new(writer) as Box<dyn Write + 'static>),
         remote_addr,
         secure,
         method,
@@ -293,11 +313,11 @@ impl Request {
     /// If you call this on a non-websocket request, tiny-http will wait until this `Stream` object
     ///  is destroyed before continuing to read or write on the socket. Therefore you should always
     ///  destroy it as soon as possible.
-    pub fn upgrade<R: Read>(
+    pub fn upgrade<R: AsyncRead>(
         mut self,
         protocol: &str,
         response: Response<R>,
-    ) -> Box<dyn ReadWrite + Send> {
+    ) -> Box<dyn ReadWrite> {
         use util::CustomStream;
 
         response
@@ -318,9 +338,9 @@ impl Request {
                 sender,
                 inner: stream,
             };
-            Box::new(stream) as Box<dyn ReadWrite + Send>
+            Box::new(stream) as Box<dyn ReadWrite>
         } else {
-            Box::new(stream) as Box<dyn ReadWrite + Send>
+            Box::new(stream) as Box<dyn ReadWrite>
         }
     }
 
@@ -376,20 +396,20 @@ impl Request {
     /// the writing of the next response.
     /// Therefore you should always destroy the `Writer` as soon as possible.
     #[inline]
-    pub fn into_writer(mut self) -> Box<dyn Write + Send + 'static> {
+    pub fn into_writer(mut self) -> Box<dyn Write + 'static> {
         let writer = self.into_writer_impl();
         if let Some(sender) = self.notify_when_responded.take() {
             let writer = NotifyOnDrop {
                 sender,
                 inner: writer,
             };
-            Box::new(writer) as Box<dyn Write + Send + 'static>
+            Box::new(writer) as Box<dyn Write + 'static>
         } else {
             writer
         }
     }
 
-    fn into_writer_impl(&mut self) -> Box<dyn Write + Send + 'static> {
+    fn into_writer_impl(&mut self) -> Box<dyn Write + 'static> {
         use std::mem;
 
         assert!(self.response_writer.is_some());
@@ -399,7 +419,7 @@ impl Request {
         writer.unwrap()
     }
 
-    fn into_reader_impl(&mut self) -> Box<dyn Read + Send + 'static> {
+    fn into_reader_impl(&mut self) -> Box<dyn Read + 'static> {
         use std::mem;
 
         assert!(self.data_reader.is_some());
@@ -413,7 +433,7 @@ impl Request {
     #[inline]
     pub fn respond<R>(mut self, response: Response<R>) -> Result<(), IoError>
     where
-        R: Read,
+        R: AsyncRead,
     {
         let res = self.respond_impl(response);
         if let Some(sender) = self.notify_when_responded.take() {
@@ -424,7 +444,7 @@ impl Request {
 
     fn respond_impl<R>(&mut self, response: Response<R>) -> Result<(), IoError>
     where
-        R: Read,
+        R: AsyncRead,
     {
         // Droping the request reader now so that further requests can start processing immediately.
         self.data_reader = None;
@@ -476,7 +496,7 @@ impl Drop for Request {
             let response = Response::empty(500);
             let _ = self.respond_impl(response); // ignoring any potential error
             if let Some(sender) = self.notify_when_responded.take() {
-                sender.send(()).unwrap();
+                futures_lite::future::block_on(sender.send(())).unwrap();
             }
         }
     }
@@ -485,8 +505,8 @@ impl Drop for Request {
 /// Dummy trait that regroups the `Read` and `Write` traits.
 ///
 /// Automatically implemented on all types that implement both `Read` and `Write`.
-pub trait ReadWrite: Read + Write {}
-impl<T> ReadWrite for T where T: Read + Write {}
+pub trait ReadWrite: AsyncRead + AsyncWrite {}
+impl<T> ReadWrite for T where T: AsyncRead + AsyncWrite {}
 
 #[cfg(test)]
 mod tests {

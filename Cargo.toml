@@ -11,16 +11,24 @@ repository = "https://github.com/tiny-http/tiny-http"
 edition = '2018'
 
 [features]
-default = []
-ssl = ["openssl"]
+#default = ["ssl"]
+ssl = ["async-native-tls"]
 
 [dependencies]
 ascii = "1.0"
 chunked_transfer = "1"
-openssl = { version = "0.10", optional = true }
+#openssl = { version = "0.10", optional = true }
 url = "2"
 chrono = "0.4"
 log = "0.4"
+# TODO: find some way to be more agnostic with regard to the runtime
+async-net = "1.4.3"
+#async-executor = "1.3.0"
+futures-lite = "1.8.0"
+async-lock = "2.2.0"
+async-channel = "1.4.2"
+async-fs = "1.3.0"
+async-native-tls = { version = "0.3", features = [], optional = true }
 
 [dev-dependencies]
 rustc-serialize = "0.3"

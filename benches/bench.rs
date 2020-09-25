@@ -51,11 +51,11 @@ fn parallel_requests(bencher: &mut Criterion) {
     let server = tiny_http::Server::http("0.0.0.0:0").unwrap();
     let port = server.server_addr().port();
 
-    bencher.bench_function("parallel_requests 1000", |b| {
+    bencher.bench_function("parallel_requests 100", |b| {
         b.iter(|| {
             let mut streams = Vec::new();
 
-            for _ in 0..black_box(1000usize) {
+            for _ in 0..black_box(100usize) {
                 let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
                 (write!(
                     stream,

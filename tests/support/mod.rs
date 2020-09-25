@@ -1,10 +1,11 @@
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tiny_http;
 
 /// Creates a server and a client connected to the server.
-pub fn new_one_server_one_client() -> (tiny_http::Server, TcpStream) {
+pub fn new_one_server_one_client() -> (Arc<tiny_http::Server>, TcpStream) {
     let server = tiny_http::Server::http("0.0.0.0:0").unwrap();
     let port = server.server_addr().port();
     let client = TcpStream::connect(("127.0.0.1", port)).unwrap();

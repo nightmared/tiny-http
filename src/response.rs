@@ -4,12 +4,16 @@ use crate::util;
 use std::cmp::Ordering;
 use std::sync::mpsc::Receiver;
 
+use std::io;
 use std::io::Result as IoResult;
-use std::io::{self, Cursor, Read, Write};
-
-use std::fs::File;
 
 use std::str::FromStr;
+
+use std::pin::Pin;
+
+use async_fs::File;
+use futures_lite::io::Cursor;
+use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Object representing an HTTP response whose purpose is to be given to a `Request`.
 ///
@@ -34,7 +38,7 @@ use std::str::FromStr;
 ///
 pub struct Response<R>
 where
-    R: Read,
+    R: AsyncRead,
 {
     reader: R,
     status_code: StatusCode,
@@ -44,7 +48,7 @@ where
 }
 
 /// A `Response` without a template parameter.
-pub type ResponseBox = Response<Box<dyn Read + Send>>;
+pub type ResponseBox = Response<Pin<Box<dyn AsyncRead>>>;
 
 /// Transfer encoding to use when sending the message.
 /// Note that only *supported* encoding are listed here.
@@ -74,35 +78,39 @@ fn build_date_header() -> Header {
     Header::from_bytes(&b"Date"[..], &d.to_string().into_bytes()[..]).unwrap()
 }
 
-fn write_message_header<W>(
+async fn write_message_header<W>(
     mut writer: W,
     http_version: &HTTPVersion,
     status_code: &StatusCode,
     headers: &[Header],
 ) -> IoResult<()>
 where
-    W: Write,
+    W: AsyncWrite + Unpin,
 {
     // writing status line
-    write!(
-        &mut writer,
-        "HTTP/{}.{} {} {}\r\n",
-        http_version.0,
-        http_version.1,
-        status_code.0,
-        status_code.default_reason_phrase()
-    )?;
+    writer
+        .write(
+            format!(
+                "HTTP/{}.{} {} {}\r\n",
+                http_version.0,
+                http_version.1,
+                status_code.0,
+                status_code.default_reason_phrase()
+            )
+            .as_bytes(),
+        )
+        .await?;
 
     // writing headers
     for header in headers.iter() {
-        writer.write_all(header.field.as_str().as_ref())?;
-        write!(&mut writer, ": ")?;
-        writer.write_all(header.value.as_str().as_ref())?;
-        write!(&mut writer, "\r\n")?;
+        writer.write_all(header.field.as_str().as_ref()).await?;
+        writer.write(b": ").await?;
+        writer.write_all(header.value.as_str().as_ref()).await?;
+        writer.write(b"\r\n").await?;
     }
 
     // separator between header and data
-    write!(&mut writer, "\r\n")?;
+    writer.write(b"\r\n").await?;
 
     Ok(())
 }
@@ -174,7 +182,7 @@ fn choose_transfer_encoding(
 
 impl<R> Response<R>
 where
-    R: Read,
+    R: AsyncRead,
 {
     /// Creates a new Response object.
     ///
@@ -283,7 +291,7 @@ where
     /// Returns the same request, but with different data.
     pub fn with_data<S>(self, reader: S, data_length: Option<usize>) -> Response<S>
     where
-        S: Read,
+        S: AsyncRead,
     {
         Response {
             reader,
@@ -303,7 +311,7 @@ where
     ///  decide which features (most notably, encoding) to use.
     ///
     /// Note: does not flush the writer.
-    pub fn raw_print<W: Write>(
+    pub async fn raw_print<W: AsyncWrite>(
         mut self,
         mut writer: W,
         http_version: HTTPVersion,
@@ -359,14 +367,14 @@ where
         // we don't know it, we buffer the entire response first here
         // while this is an expensive operation, it is only ever needed for clients using HTTP 1.0
         let (mut reader, data_length) = match (self.data_length, transfer_encoding) {
-            (Some(l), _) => (Box::new(self.reader) as Box<dyn Read>, Some(l)),
+            (Some(l), _) => (Box::new(self.reader) as Box<dyn AsyncRead>, Some(l)),
             (None, Some(TransferEncoding::Identity)) => {
                 let mut buf = Vec::new();
                 self.reader.read_to_end(&mut buf)?;
                 let l = buf.len();
-                (Box::new(Cursor::new(buf)) as Box<dyn Read>, Some(l))
+                (Box::new(Cursor::new(buf)) as Box<dyn AsyncRead>, Some(l))
             }
-            _ => (Box::new(self.reader) as Box<dyn Read>, None),
+            _ => (Box::new(self.reader) as Box<dyn AsyncRead>, None),
         };
 
         // checking whether to ignore the body of the response
@@ -439,12 +447,12 @@ where
 
 impl<R> Response<R>
 where
-    R: Read + Send + 'static,
+    R: AsyncRead + 'static,
 {
     /// Turns this response into a `Response<Box<Read + Send>>`.
     pub fn boxed(self) -> ResponseBox {
         Response {
-            reader: Box::new(self.reader) as Box<dyn Read + Send>,
+            reader: Box::pin(self.reader) as Pin<Box<dyn AsyncRead>>,
             status_code: self.status_code,
             headers: self.headers,
             data_length: self.data_length,
@@ -458,8 +466,8 @@ impl Response<File> {
     ///
     /// The `Content-Type` will **not** be automatically detected,
     ///  you must set it yourself.
-    pub fn from_file(file: File) -> Response<File> {
-        let file_size = file.metadata().ok().map(|v| v.len() as usize);
+    pub async fn from_file(file: File) -> Response<File> {
+        let file_size = file.metadata().await.ok().map(|v| v.len() as usize);
 
         Response::new(
             StatusCode(200),
@@ -471,6 +479,7 @@ impl Response<File> {
     }
 }
 
+/*
 impl Response<Cursor<Vec<u8>>> {
     pub fn from_data<D>(data: D) -> Response<Cursor<Vec<u8>>>
     where
@@ -540,3 +549,4 @@ impl Clone for Response<io::Empty> {
         }
     }
 }
+*/

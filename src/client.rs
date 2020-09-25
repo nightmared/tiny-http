@@ -2,16 +2,21 @@ use ascii::AsciiString;
 
 use std::io::Error as IoError;
 use std::io::Result as IoResult;
-use std::io::{BufReader, BufWriter, ErrorKind, Read};
 
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::str::FromStr;
+use std::task::{Context, Poll};
 
 use crate::common::{HTTPVersion, Method};
-use crate::util::RefinedTcpStream;
-use crate::util::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
+use crate::util::{
+    RefinedTcpStream, SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder,
+};
 
-use crate::Request;
+use crate::{Request, Response, StatusCode};
+
+use futures_lite::io::{BufReader, BufWriter, ErrorKind};
+use futures_lite::Stream;
 
 /// A ClientConnection is an object that will store a socket to a client
 /// and return Request objects.
@@ -171,17 +176,14 @@ impl ClientConnection {
     }
 }
 
-impl Iterator for ClientConnection {
+impl Stream for ClientConnection {
     type Item = Request;
-    /// Blocks until the next Request is available.
-    /// Returns None when no new Requests will come from the client.
-    fn next(&mut self) -> Option<Request> {
-        use {crate::Response, crate::StatusCode};
 
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Request>> {
         // the client sent a "connection: close" header in this previous request
         //  or is using HTTP 1.0, meaning that no new request will come
         if self.no_more_requests {
-            return None;
+            return Poll::Ready(None);
         }
 
         loop {
@@ -192,16 +194,16 @@ impl Iterator for ClientConnection {
                     response
                         .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
                         .ok();
-                    return None; // we don't know where the next request would start,
-                                 // se we have to close
+                    return Poll::Ready(None); // we don't know where the next request would start,
+                                              // se we have to close
                 }
 
                 Err(ReadError::WrongHeader(ver)) => {
                     let writer = self.sink.next().unwrap();
                     let response = Response::new_empty(StatusCode(400));
                     response.raw_print(writer, ver, &[], false, None).ok();
-                    return None; // we don't know where the next request would start,
-                                 // se we have to close
+                    return Poll::Ready(None); // we don't know where the next request would start,
+                                              // se we have to close
                 }
 
                 Err(ReadError::ReadIoError(ref err)) if err.kind() == ErrorKind::TimedOut => {
@@ -211,17 +213,17 @@ impl Iterator for ClientConnection {
                     response
                         .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
                         .ok();
-                    return None; // closing the connection
+                    return Poll::Ready(None); // closing the connection
                 }
 
                 Err(ReadError::ExpectationFailed(ver)) => {
                     let writer = self.sink.next().unwrap();
                     let response = Response::new_empty(StatusCode(417));
                     response.raw_print(writer, ver, &[], true, None).ok();
-                    return None; // TODO: should be recoverable, but needs handling in case of body
+                    return Poll::Ready(None); // TODO: should be recoverable, but needs handling in case of body
                 }
 
-                Err(ReadError::ReadIoError(_)) => return None,
+                Err(ReadError::ReadIoError(_)) => return Poll::Ready(None),
 
                 Ok(rq) => rq,
             };
@@ -268,7 +270,7 @@ impl Iterator for ClientConnection {
             }
 
             // returning the request
-            return Some(rq);
+            return Poll::Ready(Some(rq));
         }
     }
 }

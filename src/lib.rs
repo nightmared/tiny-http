@@ -98,8 +98,8 @@ use std::io::Error as IoError;
 use std::io::Result as IoResult;
 use std::net;
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -135,6 +135,8 @@ pub struct Server {
 
     // result of TcpListener::local_addr()
     listening_addr: net::SocketAddr,
+
+    num_connections: Arc<AtomicUsize>,
 }
 
 enum Message {
@@ -233,49 +235,51 @@ impl Server {
         type SslContext = openssl::ssl::SslContext;
         #[cfg(not(feature = "ssl"))]
         type SslContext = ();
-        let ssl: Option<SslContext> = match config.ssl {
-            #[cfg(feature = "ssl")]
-            Some(mut config) => {
-                use openssl::pkey::PKey;
-                use openssl::ssl;
-                use openssl::ssl::SslVerifyMode;
-                use openssl::x509::X509;
 
-                let mut ctxt = SslContext::builder(ssl::SslMethod::tls())?;
-                ctxt.set_cipher_list("DEFAULT")?;
-                let certificate = X509::from_pem(&config.certificate[..])?;
-                ctxt.set_certificate(&certificate)?;
-                let private_key = PKey::private_key_from_pem(&config.private_key[..])?;
-                ctxt.set_private_key(&private_key)?;
-                ctxt.set_verify(SslVerifyMode::NONE);
-                ctxt.check_private_key()?;
+        #[cfg(feature = "ssl")]
+        let ssl: Option<SslContext> = config.ssl.map(|mut config| {
+            use openssl::pkey::PKey;
+            use openssl::ssl;
+            use openssl::ssl::SslVerifyMode;
+            use openssl::x509::X509;
 
-                // let's wipe the certificate and private key from memory, because we're
-                // better safe than sorry
-                for b in &mut config.certificate {
-                    *b = 0;
-                }
-                for b in &mut config.private_key {
-                    *b = 0;
-                }
+            let mut ctxt = SslContext::builder(ssl::SslMethod::tls())?;
+            ctxt.set_cipher_list("DEFAULT")?;
+            let certificate = X509::from_pem(&config.certificate[..])?;
+            ctxt.set_certificate(&certificate)?;
+            let private_key = PKey::private_key_from_pem(&config.private_key[..])?;
+            ctxt.set_private_key(&private_key)?;
+            ctxt.set_verify(SslVerifyMode::NONE);
+            ctxt.check_private_key()?;
 
-                Some(ctxt.build())
+            // let's wipe the certificate and private key from memory, because we're
+            // better safe than sorry
+            for b in &mut config.certificate {
+                *b = 0;
             }
-            #[cfg(not(feature = "ssl"))]
-            Some(_) => {
-                return Err(
-                    "Building a server with SSL requires enabling the `ssl` feature \
-                                   in tiny-http"
-                        .to_owned()
-                        .into(),
-                )
+            for b in &mut config.private_key {
+                *b = 0;
             }
-            None => None,
+
+            ctxt.build()
+        });
+        #[cfg(not(feature = "ssl"))]
+        let ssl: Option<SslContext> = if config.ssl.is_some() {
+            return Err(
+                "Building a server with SSL requires enabling the `ssl` feature in tiny-http"
+                    .to_owned()
+                    .into(),
+            );
+        } else {
+            None
         };
 
         // creating a task where server.accept() is continuously called
         // and ClientConnection objects are pushed in the messages queue
         let messages = MessagesQueue::with_capacity(8);
+
+        let num_connections = Arc::new(AtomicUsize::new(0));
+        let num_connections_clone = num_connections.clone();
 
         let inside_close_trigger = close_trigger.clone();
         let inside_messages = messages.clone();
@@ -287,6 +291,7 @@ impl Server {
             while !inside_close_trigger.load(Relaxed) {
                 let new_client = match server.accept() {
                     Ok((sock, _)) => {
+                        num_connections_clone.fetch_add(1, Relaxed);
                         use util::RefinedTcpStream;
                         let (read_closable, write_closable) = match ssl {
                             None => RefinedTcpStream::new(sock),
@@ -315,6 +320,7 @@ impl Server {
                     Ok(client) => {
                         let messages = inside_messages.clone();
                         let mut client = Some(client);
+                        let num_connections_clone = num_connections_clone.clone();
                         tasks_pool.spawn(Box::new(move || {
                             if let Some(client) = client.take() {
                                 // Synchronization is needed for HTTPS requests to avoid a deadlock
@@ -329,11 +335,13 @@ impl Server {
                                         messages.push(rq.into());
                                     }
                                 }
+                                num_connections_clone.fetch_sub(1, Relaxed);
                             }
                         }));
                     }
 
                     Err(e) => {
+                        num_connections_clone.fetch_sub(1, Relaxed);
                         error!("Error accepting new client: {}", e);
                         inside_messages.push(e.into());
                         break;
@@ -343,11 +351,11 @@ impl Server {
             debug!("Terminating accept thread");
         });
 
-        // result
         Ok(Server {
             messages,
             close: close_trigger,
             listening_addr: local_addr,
+            num_connections,
         })
     }
 
@@ -367,8 +375,7 @@ impl Server {
 
     /// Returns the number of clients currently connected to the server.
     pub fn num_connections(&self) -> usize {
-        unimplemented!()
-        //self.requests_receiver.lock().len()
+        self.num_connections.load(Relaxed)
     }
 
     /// Blocks until an HTTP request has been submitted and returns it.

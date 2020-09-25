@@ -192,3 +192,32 @@ fn chunked_threshold() {
     assert_eq!(resp.chunked_threshold(), 32768);
     assert_eq!(resp.with_chunked_threshold(42).chunked_threshold(), 42);
 }
+
+#[test]
+fn num_connections() {
+    let server = tiny_http::Server::http("0.0.0.0:0").unwrap();
+    let port = server.server_addr().port();
+
+    let mut clients: Vec<TcpStream> = (0..20)
+        .into_iter()
+        .map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap())
+        .collect();
+
+    thread::sleep(Duration::from_millis(100));
+
+    assert_eq!(server.num_connections(), 20);
+
+    for i in 0..10 {
+        (write!(clients[i], "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")).unwrap();
+    }
+
+    assert_eq!(server.num_connections(), 20);
+
+    for i in 0..5 {
+        clients[i].shutdown(std::net::Shutdown::Both).unwrap();
+    }
+
+    thread::sleep(Duration::from_millis(100));
+
+    assert_eq!(server.num_connections(), 15);
+}

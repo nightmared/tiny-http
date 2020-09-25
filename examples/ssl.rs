@@ -1,5 +1,3 @@
-extern crate tiny_http;
-
 #[cfg(not(feature = "ssl"))]
 fn main() {
     println!("This example requires the `ssl` feature to be enabled");

@@ -8,6 +8,7 @@ documentation = "https://tiny-http.github.io/tiny-http/tiny_http/index.html"
 keywords = ["http", "server", "web"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tiny-http/tiny-http"
+edition = '2018'
 
 [features]
 default = []
@@ -25,3 +26,9 @@ log = "0.4"
 rustc-serialize = "0.3"
 sha1 = "0.6.0"
 fdlimit = "0.1"
+criterion = "0.3"
+
+
+[[bench]]
+name = "bench"
+harness = false

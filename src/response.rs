@@ -1,4 +1,5 @@
-use common::{HTTPDate, HTTPVersion, Header, StatusCode};
+use crate::common::{HTTPDate, HTTPVersion, Header, StatusCode};
+use crate::util;
 
 use std::cmp::Ordering;
 use std::sync::mpsc::Receiver;
@@ -113,8 +114,6 @@ fn choose_transfer_encoding(
     has_additional_headers: bool,
     chunked_threshold: usize,
 ) -> TransferEncoding {
-    use util;
-
     // HTTP 1.0 doesn't support other encoding
     if *http_version <= (1, 0) {
         return TransferEncoding::Identity;

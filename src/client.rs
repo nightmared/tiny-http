@@ -7,11 +7,11 @@ use std::io::{BufReader, BufWriter, ErrorKind, Read};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
-use common::{HTTPVersion, Method};
-use util::RefinedTcpStream;
-use util::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
+use crate::common::{HTTPVersion, Method};
+use crate::util::RefinedTcpStream;
+use crate::util::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
 
-use Request;
+use crate::Request;
 
 /// A ClientConnection is an object that will store a socket to a client
 /// and return Request objects.
@@ -146,7 +146,7 @@ impl ClientConnection {
         ::std::mem::swap(&mut self.next_header_source, &mut data_source);
 
         // building the next reader
-        let request = ::request::new_request(
+        let request = crate::request::new_request(
             self.secure,
             method,
             path,
@@ -157,7 +157,7 @@ impl ClientConnection {
             writer,
         )
         .map_err(|e| {
-            use request;
+            use crate::request;
             match e {
                 request::RequestCreationError::CreationIoError(e) => ReadError::ReadIoError(e),
                 request::RequestCreationError::ExpectationFailed => {
@@ -176,7 +176,7 @@ impl Iterator for ClientConnection {
     /// Blocks until the next Request is available.
     /// Returns None when no new Requests will come from the client.
     fn next(&mut self) -> Option<Request> {
-        use {Response, StatusCode};
+        use {crate::Response, crate::StatusCode};
 
         // the client sent a "connection: close" header in this previous request
         //  or is using HTTP 1.0, meaning that no new request will come
@@ -330,9 +330,9 @@ mod test {
             Ok(v) => v,
         };
 
-        assert!(method == ::Method::Get);
+        assert!(method == crate::Method::Get);
         assert!(path == "/hello");
-        assert!(ver == ::common::HTTPVersion(1, 1));
+        assert!(ver == crate::common::HTTPVersion(1, 1));
 
         assert!(super::parse_request_line("GET /hello").is_err());
         assert!(super::parse_request_line("qsd qsd qsd").is_err());

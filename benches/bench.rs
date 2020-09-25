@@ -1,11 +1,5 @@
-#![feature(test)]
-
-extern crate fdlimit;
-extern crate test;
-extern crate tiny_http;
-
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::io::Write;
-use std::process::Command;
 use tiny_http::Method;
 
 #[test]
@@ -28,53 +22,64 @@ fn curl_bench() {
     drop(server);
 }
 
-#[bench]
-fn sequential_requests(bencher: &mut test::Bencher) {
+#[allow(unused)]
+fn sequential_requests(bencher: &mut Criterion) {
     let server = tiny_http::Server::http("0.0.0.0:0").unwrap();
     let port = server.server_addr().port();
 
-    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    bencher.bench_function("sequential_requests", |b| {
+        b.iter_batched(
+            || std::net::TcpStream::connect(("127.0.0.1", port)).unwrap(),
+            |mut stream: std::net::TcpStream| {
+                (write!(stream, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")).unwrap();
 
-    bencher.iter(|| {
-        (write!(stream, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")).unwrap();
+                let request = server.recv().unwrap();
 
-        let request = server.recv().unwrap();
+                assert_eq!(request.method(), &Method::Get);
 
-        assert_eq!(request.method(), &Method::Get);
-
-        request.respond(tiny_http::Response::new_empty(tiny_http::StatusCode(204)));
+                let _ = request.respond(tiny_http::Response::new_empty(tiny_http::StatusCode(204)));
+            },
+            criterion::BatchSize::LargeInput,
+        )
     });
 }
 
-#[bench]
-fn parallel_requests(bencher: &mut test::Bencher) {
+#[allow(unused)]
+fn parallel_requests(bencher: &mut Criterion) {
     fdlimit::raise_fd_limit();
 
     let server = tiny_http::Server::http("0.0.0.0:0").unwrap();
     let port = server.server_addr().port();
 
-    bencher.iter(|| {
-        let mut streams = Vec::new();
+    bencher.bench_function("parallel_requests 1000", |b| {
+        b.iter(|| {
+            let mut streams = Vec::new();
 
-        for _ in 0..1000usize {
-            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-            (write!(
-                stream,
-                "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-            ))
-            .unwrap();
-            streams.push(stream);
-        }
+            for _ in 0..black_box(1000usize) {
+                let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+                (write!(
+                    stream,
+                    "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                ))
+                .unwrap();
+                streams.push(stream);
+            }
 
-        loop {
-            let request = match server.try_recv().unwrap() {
-                None => break,
-                Some(rq) => rq,
-            };
+            loop {
+                let request = match server.try_recv().unwrap() {
+                    None => break,
+                    Some(rq) => rq,
+                };
 
-            assert_eq!(request.method(), &Method::Get);
+                assert_eq!(request.method(), &Method::Get);
 
-            request.respond(tiny_http::Response::new_empty(tiny_http::StatusCode(204)));
-        }
+                request
+                    .respond(tiny_http::Response::new_empty(tiny_http::StatusCode(204)))
+                    .unwrap();
+            }
+        })
     });
 }
+
+criterion_group!(benches, sequential_requests, parallel_requests);
+criterion_main!(benches);

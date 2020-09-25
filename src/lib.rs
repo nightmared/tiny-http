@@ -93,17 +93,6 @@ let _ = request.respond(response);
 #![crate_type = "lib"]
 #![forbid(unsafe_code)]
 
-#[macro_use]
-extern crate log;
-
-extern crate ascii;
-extern crate chrono;
-extern crate chunked_transfer;
-extern crate url;
-
-#[cfg(feature = "ssl")]
-extern crate openssl;
-
 use std::error::Error;
 use std::io::Error as IoError;
 use std::io::Result as IoResult;
@@ -115,6 +104,8 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+use log::{debug, error};
 
 use client::ClientConnection;
 use util::MessagesQueue;
@@ -216,7 +207,7 @@ impl Server {
         A: ToSocketAddrs,
     {
         Server::new(ServerConfig {
-            addr: addr,
+            addr,
             ssl: Some(config),
         })
     }
@@ -250,14 +241,14 @@ impl Server {
                 use openssl::ssl::SslVerifyMode;
                 use openssl::x509::X509;
 
-                let mut ctxt = try!(SslContext::builder(ssl::SslMethod::tls()));
-                try!(ctxt.set_cipher_list("DEFAULT"));
-                let certificate = try!(X509::from_pem(&config.certificate[..]));
-                try!(ctxt.set_certificate(&certificate));
-                let private_key = try!(PKey::private_key_from_pem(&config.private_key[..]));
-                try!(ctxt.set_private_key(&private_key));
+                let mut ctxt = SslContext::builder(ssl::SslMethod::tls())?;
+                ctxt.set_cipher_list("DEFAULT")?;
+                let certificate = X509::from_pem(&config.certificate[..])?;
+                ctxt.set_certificate(&certificate)?;
+                let private_key = PKey::private_key_from_pem(&config.private_key[..])?;
+                ctxt.set_private_key(&private_key)?;
                 ctxt.set_verify(SslVerifyMode::NONE);
-                try!(ctxt.check_private_key());
+                ctxt.check_private_key()?;
 
                 // let's wipe the certificate and private key from memory, because we're
                 // better safe than sorry

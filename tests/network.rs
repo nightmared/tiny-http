@@ -1,5 +1,3 @@
-extern crate tiny_http;
-
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::thread;

@@ -1,7 +1,3 @@
-extern crate rustc_serialize;
-extern crate sha1;
-extern crate tiny_http;
-
 use std::io::Cursor;
 use std::io::Read;
 use std::thread::spawn;

@@ -1,6 +1,3 @@
-extern crate ascii;
-extern crate tiny_http;
-
 use ascii::AsAsciiStr;
 
 /**!

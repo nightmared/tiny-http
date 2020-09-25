@@ -2,9 +2,6 @@ use ascii::AsciiString;
 use std::fs;
 use std::path::Path;
 
-extern crate ascii;
-extern crate tiny_http;
-
 fn get_content_type(path: &Path) -> &'static str {
     let extension = match path.extension() {
         None => return "text/plain",

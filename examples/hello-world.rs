@@ -1,5 +1,3 @@
-extern crate tiny_http;
-
 use std::sync::Arc;
 use std::thread;
 

@@ -32,12 +32,6 @@ Add this to the `Cargo.toml` file of your project:
 tiny_http = "0.6"
 ```
 
-Don't forget to add the external crate:
-
-```rust
-extern crate tiny_http;
-```
-
 ### Usage
 
 ```rust

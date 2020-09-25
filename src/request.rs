@@ -7,9 +7,9 @@ use std::str::FromStr;
 
 use std::sync::mpsc::Sender;
 
+use crate::util::{self, EqualReader};
+use crate::{HTTPVersion, Header, Method, Response, StatusCode};
 use chunked_transfer::Decoder;
-use util::EqualReader;
-use {HTTPVersion, Header, Method, Response, StatusCode};
 
 /// Represents an HTTP request made by a client.
 ///
@@ -329,8 +329,6 @@ impl Request {
     /// # Example
     ///
     /// ```no_run
-    /// # extern crate rustc_serialize;
-    /// # extern crate tiny_http;
     /// # use rustc_serialize::json::Json;
     /// # use std::io::Read;
     /// # fn get_content_type(_: &tiny_http::Request) -> &'static str { "" }
